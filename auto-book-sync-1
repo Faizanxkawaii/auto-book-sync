@@ -1,0 +1,36 @@
+name: Auto Publish Books to WeLib
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - run: |
+          pip install playwright aiohttp
+          playwright install chromium
+      
+      - run: python scraper.py
+        env:
+          BOOKHOUSE_URL: ${{ secrets.BOOKHOUSE_URL }}
+          BOOKHOUSE_USER: ${{ secrets.BOOKHOUSE_USER }}
+          BOOKHOUSE_PASS: ${{ secrets.BOOKHOUSE_PASS }}
+          WELIB_USER: ${{ secrets.WELIB_USER }}
+          WELIB_PASS: ${{ secrets.WELIB_PASS }}
+      
+      - if: always()
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add synced.json
+          git diff --cached --quiet || git commit -m "sync state [skip ci]"
+          git push
