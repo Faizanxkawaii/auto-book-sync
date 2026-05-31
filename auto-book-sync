@@ -1,0 +1,183 @@
+import os
+import json
+import asyncio
+import aiohttp
+from pathlib import Path
+from playwright.async_api import async_playwright
+
+STATE_FILE = 'synced.json'
+
+def load_state():
+    if Path(STATE_FILE).exists():
+        with open(STATE_FILE) as f:
+            return set(json.load(f))
+    return set()
+
+def save_state(synced_ids):
+    with open(STATE_FILE, 'w') as f:
+        json.dump(list(synced_ids), f)
+
+async def download_cover(url, book_id):
+    if not url:
+        return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    ext = url.split('.')[-1].split('?')[0][:4] or 'jpg'
+                    path = f"cover_{book_id}.{ext}"
+                    with open(path, 'wb') as f:
+                        f.write(await resp.read())
+                    return path
+    except Exception as e:
+        print(f"Cover download failed: {e}")
+    return None
+
+class BookHouseScraper:
+    def __init__(self, page):
+        self.page = page
+        self.base = os.environ.get('BOOKHOUSE_URL', 'https://book-house.base44.app')
+    
+    async def login(self):
+        print("Book House login...")
+        await self.page.goto(f"{self.base}/admin-login", wait_until='networkidle')
+        await self.page.wait_for_selector('input[type="email"], input[name="email"], input[type="text"]', timeout=10000)
+        await self.page.fill('input[type="email"], input[name="email"], input[type="text"]', os.environ['BOOKHOUSE_USER'])
+        await self.page.fill('input[type="password"], input[name="password"]', os.environ['BOOKHOUSE_PASS'])
+        await self.page.click('button[type="submit"]')
+        await self.page.wait_for_load_state('networkidle')
+        print("Book House andar")
+    
+    async def get_books(self):
+        print("Books utha rahi hun...")
+        await self.page.goto(f"{self.base}/admin-books", wait_until='networkidle')
+        await self.page.wait_for_timeout(3000)
+        
+        book_cards = await self.page.query_selector_all('.book-card, [data-book-id], .admin-book-item, tr[data-id]')
+        
+        books = []
+        for card in book_cards:
+            try:
+                book_id = await card.get_attribute('data-book-id') or await card.get_attribute('id')
+                if not book_id:
+                    continue
+                
+                title = await card.eval_on_selector('.title, .book-title, h3, h2', 'el => el.innerText.trim()')
+                author = await card.eval_on_selector('.author, .book-author', 'el => el.innerText.trim()') or ''
+                description = await card.eval_on_selector('.description, .book-desc, .summary', 'el => el.innerText.trim()') or ''
+                download_url = await card.eval_on_selector('.download-link, a[href*="download"]', 'el => el.href') or ''
+                cover_url = await card.eval_on_selector('.cover img, .book-cover img', 'el => el.src') or ''
+                fmt = await card.eval_on_selector('.format, .book-format', 'el => el.innerText.trim()') or 'PDF'
+                lang = await card.eval_on_selector('.language, .book-lang', 'el => el.innerText.trim()') or 'English'
+                year = await card.eval_on_selector('.year, .book-year', 'el => el.innerText.trim()') or ''
+                size = await card.eval_on_selector('.size, .book-size', 'el => el.innerText.trim()') or ''
+                
+                books.append({
+                    'id': book_id,
+                    'title': title,
+                    'author': author,
+                    'description': description,
+                    'download_url': download_url,
+                    'cover_url': cover_url,
+                    'format': fmt,
+                    'language': lang,
+                    'year': year,
+                    'size': size
+                })
+            except Exception as e:
+                print(f"Card parse error: {e}")
+                continue
+        
+        return books
+
+class WeLibPublisher:
+    def __init__(self, page):
+        self.page = page
+        self.base = 'https://welib.st'
+    
+    async def login(self):
+        print("WeLib login...")
+        await self.page.goto(f"{self.base}/login", wait_until='networkidle')
+        await self.page.wait_for_selector('input[type="email"], input[name="email"], input[name="username"]', timeout=10000)
+        await self.page.fill('input[type="email"], input[name="email"], input[name="username"]', os.environ['WELIB_USER'])
+        await self.page.fill('input[type="password"], input[name="password"]', os.environ['WELIB_PASS'])
+        await self.page.click('button[type="submit"]')
+        await self.page.wait_for_load_state('networkidle')
+        print("WeLib andar")
+    
+    async def publish(self, book):
+        print(f"Publishing: {book['title'][:50]}...")
+        await self.page.goto(f"{self.base}/upload", wait_until='networkidle')
+        await self.page.wait_for_timeout(2000)
+        
+        await self.page.fill('input[name="title"], #title', book['title'])
+        await self.page.fill('input[name="author"], #author', book['author'])
+        await self.page.fill('textarea[name="description"], #description', book['description'])
+        await self.page.fill('input[name="language"], #language', book['language'])
+        await self.page.fill('input[name="year"], #year', str(book['year']))
+        await self.page.fill('input[name="format"], #format', book['format'])
+        await self.page.fill('input[name="size"], #size', book['size'])
+        await self.page.fill('input[name="download_url"], #download_url, input[name="url"]', book['download_url'])
+        
+        if book.get('cover_url'):
+            cover_path = await download_cover(book['cover_url'], book['id'])
+            if cover_path and Path(cover_path).exists():
+                await self.page.set_input_files('input[type="file"][name="cover"], input[type="file"][accept*="image"]', cover_path)
+                Path(cover_path).unlink(missing_ok=True)
+            else:
+                await self.page.fill('input[name="cover_url"], #cover_url', book['cover_url'])
+        
+        await self.page.click('button[type="submit"], .submit-btn, .publish-btn')
+        await self.page.wait_for_load_state('networkidle')
+        await self.page.wait_for_timeout(3000)
+        
+        page_text = await self.page.inner_text('body')
+        is_success = any(ind in page_text.lower() for ind in ['success', 'published', 'uploaded', 'done', 'thank you'])
+        return is_success
+
+async def main():
+    synced = load_state()
+    print(f"Pehle se synced: {len(synced)} books")
+    
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        )
+        
+        page1 = await context.new_page()
+        scraper = BookHouseScraper(page1)
+        await scraper.login()
+        books = await scraper.get_books()
+        print(f"Total books mile: {len(books)}")
+        
+        new_books = [b for b in books if b['id'] not in synced]
+        print(f"Naye books: {len(new_books)}")
+        
+        if not new_books:
+            print("Kuch naya nahi, bye.")
+            await browser.close()
+            return
+        
+        page2 = await context.new_page()
+        publisher = WeLibPublisher(page2)
+        await publisher.login()
+        
+        success = 0
+        for book in new_books:
+            try:
+                if await publisher.publish(book):
+                    synced.add(book['id'])
+                    save_state(synced)
+                    success += 1
+                    print(f"Done: {book['title'][:40]}")
+                else:
+                    print(f"Fail: {book['title'][:40]}")
+            except Exception as e:
+                print(f"Error: {book['title'][:40]} - {e}")
+        
+        await browser.close()
+        print(f"\nKhatam! {success}/{len(new_books)} books chale gaye")
+
+if __name__ == '__main__':
+    asyncio.run(main())
